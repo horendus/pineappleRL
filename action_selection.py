@@ -5,7 +5,7 @@ import torch
 from typing import List
 
 from ofc_env import OfcEnv, State, Action
-from state_encoding import encode_state, get_input_dim
+from state_encoding import encode_state, encode_state_batch, get_input_dim
 from value_net import ValueNet
 
 
@@ -23,6 +23,7 @@ def choose_best_action_with_value_net(
 ) -> Action:
     """
     Choose the best action using the trained value network.
+    Optimized with batch encoding for faster performance.
     
     Args:
         state: Current game state
@@ -41,23 +42,19 @@ def choose_best_action_with_value_net(
         device = get_device()
     
     model.eval()
-    best_action = None
-    best_value = float('-inf')
     
     with torch.no_grad():
-        for action in legal_actions:
-            # Simulate action to get next state
-            next_state, _, done = env.step(state, action)
-            
-            # Encode and evaluate
-            encoded = encode_state(next_state).to(device)
-            value = model(encoded.unsqueeze(0)).item()
-            
-            if value > best_value:
-                best_value = value
-                best_action = action
-    
-    return best_action if best_action is not None else legal_actions[0]
+        # Simulate all actions and batch encode (much faster)
+        next_states = [env.step(state, action)[0] for action in legal_actions]
+        encoded_batch = encode_state_batch(next_states).to(device)
+        values = model(encoded_batch).squeeze()
+        
+        # Find best action
+        if values.dim() == 0:  # Single action
+            best_idx = 0
+        else:\n            best_idx = values.argmax().item()
+        
+        return legal_actions[best_idx]
 
 
 def choose_best_action_beam_search(
@@ -70,6 +67,7 @@ def choose_best_action_beam_search(
 ) -> Action:
     """
     Choose best action using beam search with value network.
+    Optimized with batch encoding.
     
     Args:
         state: Current game state
@@ -89,25 +87,25 @@ def choose_best_action_beam_search(
         device = get_device()
     
     model.eval()
-    candidates = []
     
     with torch.no_grad():
-        for action in legal_actions:
-            # Simulate action
-            next_state, _, done = env.step(state, action)
-            
-            # Encode and evaluate
-            encoded = encode_state(next_state).to(device)
-            value = model(encoded.unsqueeze(0)).item()
-            
-            candidates.append((value, action))
-    
-    # Sort by value (descending) and take top beam_width
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    top_candidates = candidates[:beam_width]
-    
-    # Return the best one
-    return top_candidates[0][1] if top_candidates else legal_actions[0]
+        # Batch process all actions (much faster)
+        next_states = [env.step(state, action)[0] for action in legal_actions]
+        encoded_batch = encode_state_batch(next_states).to(device)
+        values = model(encoded_batch).squeeze()
+        
+        # Convert to list and pair with actions
+        if values.dim() == 0:  # Single action
+            return legal_actions[0]
+        
+        values_list = values.cpu().tolist()
+        candidates = list(zip(values_list, legal_actions))
+        
+        # Sort by value (descending) and take top beam_width
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        
+        # Return the best one
+        return candidates[0][1]
 
 
 def load_trained_model(model_path: str = 'value_net.pth', device: torch.device = None) -> ValueNet:

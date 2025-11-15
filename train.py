@@ -14,10 +14,60 @@ import time
 import os
 import glob
 import re
+import multiprocessing as mp
+from multiprocessing import Pool
 
 from ofc_env import OfcEnv, State, Action
-from state_encoding import encode_state, get_input_dim
+from state_encoding import encode_state, encode_state_batch, get_input_dim
 from value_net import ValueNet
+
+
+# Worker function for parallel episode generation (must be at module level for pickling)
+def _generate_episode_worker(seed: int) -> List[Tuple[State, float]]:
+    """
+    Worker function to generate one episode in a separate process.
+    
+    Args:
+        seed: Random seed for reproducibility
+    
+    Returns:
+        List of (state, final_score) pairs
+    """
+    # Set random seed for this worker
+    random.seed(seed)
+    np.random.seed(seed)
+    
+    # Create environment (each worker gets its own)
+    env = OfcEnv()
+    state = env.reset()
+    episode_states = []
+    
+    while True:
+        # Get legal actions
+        legal_actions = env.legal_actions(state)
+        
+        if not legal_actions:
+            episode_states.append(state)
+            break
+        
+        # Save current state BEFORE stepping
+        episode_states.append(state)
+        
+        # Use random action (for parallel generation, we only do random episodes)
+        action = legal_actions[random.randint(0, len(legal_actions) - 1)]
+        
+        # Step environment
+        state, reward, done = env.step(state, action)
+        
+        if done:
+            episode_states.append(state)
+            break
+    
+    # Compute final score
+    final_score = env.score(state)
+    
+    # Return (state, final_score) pairs
+    return [(s, final_score) for s in episode_states]
 
 
 class SelfPlayTrainer:
@@ -27,9 +77,10 @@ class SelfPlayTrainer:
         self,
         model: ValueNet,
         buffer_size: int = 10000,
-        batch_size: int = 32,
+        batch_size: int = 64,
         learning_rate: float = 1e-3,
-        use_cuda: bool = True
+        use_cuda: bool = True,
+        num_workers: int = None
     ):
         self.model = model
         
@@ -51,12 +102,23 @@ class SelfPlayTrainer:
         
         # Use multiple environments for parallel episode generation
         # This helps keep GPU busy while CPU generates episodes
-        self.num_envs = 4  # Number of parallel environments
+        self.num_envs = 16  # Number of parallel environments (increased for better throughput)
         self.envs = [OfcEnv() for _ in range(self.num_envs)]
+        
+        # Use pinned memory for faster CPU->GPU transfer
+        self.pin_memory = True if torch.cuda.is_available() and use_cuda else False
+        
+        # Multiprocessing pool for parallel episode generation
+        if num_workers is None:
+            num_workers = max(1, mp.cpu_count() - 2)  # Leave 2 cores for GPU and main thread
+        self.num_workers = num_workers
+        self.pool = Pool(processes=num_workers)
+        print(f"Multiprocessing: Using {num_workers} worker processes")
     
     def generate_episode(self, use_random: bool = True, env_idx: int = 0) -> List[Tuple[State, float]]:
         """
         Generate one episode of self-play.
+        Optimized for speed.
         
         Args:
             use_random: If True, use random actions. If False, use value network.
@@ -74,52 +136,61 @@ class SelfPlayTrainer:
             legal_actions = env.legal_actions(state)
             
             if not legal_actions:
-                # No legal actions, end episode
-                # Save final state before breaking
                 episode_states.append(state)
                 break
             
             # Save current state BEFORE stepping
             episode_states.append(state)
             
-            # Choose action
+            # Choose action (use faster random.choice for random)
             if use_random:
-                action = random.choice(legal_actions)
+                action = legal_actions[random.randint(0, len(legal_actions) - 1)]  # Faster than random.choice
             else:
-                # Use value network to choose best action
                 action = self._choose_action_with_net(state, legal_actions, env_idx=env_idx)
             
             # Step environment
             state, reward, done = env.step(state, action)
             
             if done:
-                # Save final state after last step
                 episode_states.append(state)
                 break
         
-        # Compute final score (use the final state)
+        # Compute final score
         final_score = env.score(state)
-        
-        # Debug: Check if board is complete
-        is_complete = all(slot is not None for slot in state.board)
-        if not is_complete and len(episode_states) > 0:
-            # Board incomplete - this shouldn't happen often
-            cards_placed = sum(1 for slot in state.board if slot is not None)
-            # If we have states but board incomplete, something went wrong
-            pass
         
         # Return (state, final_score) pairs
         return [(s, final_score) for s in episode_states]
     
-    def generate_episodes_parallel(self, num_episodes: int, use_random: bool = True) -> List[Tuple[State, float]]:
+    def generate_episodes_parallel(self, num_episodes: int, use_random: bool = True, base_seed: int = 0) -> List[Tuple[State, float]]:
         """
-        Generate multiple episodes in parallel (round-robin across environments).
-        This helps keep GPU busy while CPU generates episodes.
+        Generate multiple episodes in parallel using multiprocessing.
+        This significantly speeds up episode generation by using multiple CPU cores.
+        
+        Args:
+            num_episodes: Number of episodes to generate
+            use_random: If True, use random actions (for parallel generation)
+            base_seed: Base seed for reproducibility
+        
+        Returns:
+            List of all (state, final_score) pairs from all episodes
         """
+        if not use_random or num_episodes < 4:
+            # Fall back to sequential generation for non-random or small batches
+            all_data = []
+            for i in range(num_episodes):
+                episode_data = self.generate_episode(use_random=use_random, env_idx=i)
+                all_data.extend(episode_data)
+            return all_data
+        
+        # Generate episodes in parallel using multiprocessing
+        seeds = [base_seed + i for i in range(num_episodes)]
+        episode_results = self.pool.map(_generate_episode_worker, seeds)
+        
+        # Flatten results
         all_data = []
-        for i in range(num_episodes):
-            episode_data = self.generate_episode(use_random=use_random, env_idx=i)
+        for episode_data in episode_results:
             all_data.extend(episode_data)
+        
         return all_data
     
     def _choose_action_with_net(self, state: State, legal_actions: List[Action], env_idx: int = 0) -> Action:
@@ -143,8 +214,8 @@ class SelfPlayTrainer:
                 next_states.append(next_state)
                 valid_actions.append(action)
             
-            # Encode all states at once
-            encoded_batch = torch.stack([encode_state(s).to(self.device) for s in next_states])
+            # Encode all states at once using batch encoding (faster)
+            encoded_batch = encode_state_batch(next_states).to(self.device)
             
             # Forward pass on entire batch (much faster on GPU)
             values = self.model(encoded_batch).squeeze()
@@ -174,13 +245,21 @@ class SelfPlayTrainer:
         # Sample batch
         batch = random.sample(self.replay_buffer, self.batch_size)
         
-        # Encode states and prepare targets (batch encoding on CPU, then move to GPU)
-        states = [encode_state(s) for s, _ in batch]
-        targets = torch.tensor([score for _, score in batch], dtype=torch.float32).unsqueeze(1)
+        # Extract states and scores
+        states = [s for s, _ in batch]
+        scores = [score for _, score in batch]
         
-        # Stack states into batch and move to device
-        state_batch = torch.stack(states).to(self.device, non_blocking=True)
-        targets = targets.to(self.device, non_blocking=True)
+        # Encode states in batch (much faster than one-by-one)
+        state_batch = encode_state_batch(states)
+        targets = torch.tensor(scores, dtype=torch.float32).unsqueeze(1)
+        
+        # Move to device with pinned memory for faster transfer
+        if self.pin_memory:
+            state_batch = state_batch.pin_memory().to(self.device, non_blocking=True)
+            targets = targets.pin_memory().to(self.device, non_blocking=True)
+        else:
+            state_batch = state_batch.to(self.device, non_blocking=True)
+            targets = targets.to(self.device, non_blocking=True)
         
         # Forward pass
         self.optimizer.zero_grad()
@@ -263,22 +342,58 @@ class SelfPlayTrainer:
         # Progress bar for episodes (starting from resume point)
         pbar = tqdm(range(start_episode, num_episodes), desc="Training", unit="hand", initial=start_episode, total=num_episodes)
         
-        for episode_idx, episode in enumerate(pbar):
-            # episode is the actual episode number (0 to num_episodes-1, or start_episode to num_episodes-1)
-            # We need to track the absolute episode number for statistics
-            absolute_episode = episode
+        # Generate episodes in larger batches using multiprocessing for speed
+        episodes_per_batch = max(self.num_workers * 2, 16)  # Generate many episodes at once
+        episodes_per_train_step = 8  # Train every N episodes
+        
+        episode_idx = 0
+        while start_episode + episode_idx < num_episodes:
+            # Calculate how many episodes to generate in this batch
+            remaining = num_episodes - (start_episode + episode_idx)
+            batch_size_current = min(episodes_per_batch, remaining)
+            
+            # Calculate absolute episode number
+            absolute_episode = start_episode + episode_idx
+            
             # Gradually transition from random to learned policy
-            # First 20%: pure random, then gradually use network
             random_prob = max(0.0, 1.0 - (absolute_episode / (num_episodes * 0.8)))
-            use_random = random.random() < random_prob
+            use_random_for_batch = random_prob > 0.5  # Use multiprocessing for random episodes
             
-            # Generate episode (using round-robin across parallel envs)
-            episode_data = self.generate_episode(use_random=use_random, env_idx=absolute_episode)
+            # Generate batch of episodes
+            if use_random_for_batch:
+                # Parallel generation for random episodes
+                all_episode_data = self.generate_episodes_parallel(
+                    batch_size_current, 
+                    use_random=True,
+                    base_seed=absolute_episode * 1000
+                )
+                
+                # Split into individual episodes (each episode ~13 states)
+                episodes_list = []
+                current_ep = []
+                for state, score in all_episode_data:
+                    current_ep.append((state, score))
+                    if len(current_ep) >= 13:  # OFC typically has ~13 placements
+                        episodes_list.append(current_ep)
+                        current_ep = []
+                if current_ep:  # Add remaining
+                    episodes_list.append(current_ep)
+            else:
+                # Sequential generation for network-based episodes
+                episodes_list = []
+                for i in range(batch_size_current):
+                    episode_data = self.generate_episode(use_random=False, env_idx=absolute_episode + i)
+                    if episode_data:
+                        episodes_list.append(episode_data)
             
-            # Track statistics
-            if episode_data:
+            # Process each episode
+            for episode_data in episodes_list:
+                if not episode_data:
+                    continue
+                
+                # Track statistics
                 final_score = episode_data[-1][1]
-                total_score += final_score  # Add to total for average
+                total_score += final_score
                 if final_score > 0:
                     total_royalties += 1
                     royalty_scores.append(final_score)
@@ -286,42 +401,49 @@ class SelfPlayTrainer:
                     total_fouls += 1
                 else:
                     total_zero += 1
-            
-            # Add to buffer
-            self.add_to_buffer(episode_data)
-            
-            # Train on batch
-            if len(self.replay_buffer) >= self.batch_size:
-                loss = self.train_step()
-                losses.append(loss)
                 
-                # Update progress bar
-                avg_loss = np.mean(losses[-100:]) if losses else 0.0
-                royalty_rate = (total_royalties / (absolute_episode + 1)) * 100 if absolute_episode > 0 else 0
-                pbar.set_postfix({
-                    'loss': f'{avg_loss:.4f}',
-                    'buffer': len(self.replay_buffer),
-                    'random%': f'{random_prob*100:.1f}%',
-                    'royalties': f'{total_royalties} ({royalty_rate:.2f}%)'
-                })
-            
-            # Periodic evaluation and checkpointing
-            if absolute_episode > 0 and absolute_episode % eval_frequency == 0:
-                # Clear progress bar and print clean evaluation
-                pbar.clear()
-                print(f"\n--- Evaluation at episode {absolute_episode:,} ---\n")
-                # Pass training stats to evaluation
-                training_foul_rate = (total_fouls / (absolute_episode + 1)) * 100 if absolute_episode > 0 else 0
-                avg_score_per_hand = total_score / (absolute_episode + 1) if absolute_episode > 0 else 0.0
-                self._evaluate(total_episodes=absolute_episode+1, total_fouls=total_fouls, 
-                              total_royalties=total_royalties, total_zero=total_zero,
-                              training_foul_rate=training_foul_rate,
-                              avg_score_per_hand=avg_score_per_hand)
+                # Add to buffer
+                self.add_to_buffer(episode_data)
                 
-                # Save checkpoint
-                checkpoint_path = f'value_net_checkpoint_ep{absolute_episode}.pth'
-                torch.save(self.model.state_dict(), checkpoint_path)
-                print(f"\nCheckpoint saved: {checkpoint_path}\n")
+                # Update progress
+                episode_idx += 1
+                absolute_episode = start_episode + episode_idx - 1
+                pbar.update(1)
+                
+                # Train less frequently but do more gradient steps per cycle
+                if len(self.replay_buffer) >= self.batch_size and episode_idx % episodes_per_train_step == 0:
+                    # Do 4 gradient updates per training cycle for better amortization
+                    for _ in range(4):
+                        loss = self.train_step()
+                        losses.append(loss)
+                    
+                    # Update progress bar
+                    avg_loss = np.mean(losses[-100:]) if losses else 0.0
+                    royalty_rate = (total_royalties / (absolute_episode + 1)) * 100 if absolute_episode > 0 else 0
+                    pbar.set_postfix({
+                        'loss': f'{avg_loss:.4f}',
+                        'buffer': len(self.replay_buffer),
+                        'random%': f'{random_prob*100:.1f}%',
+                        'royalties': f'{total_royalties} ({royalty_rate:.2f}%)'
+                    })
+                
+                # Periodic evaluation and checkpointing
+                if absolute_episode > 0 and absolute_episode % eval_frequency == 0:
+                    # Clear progress bar and print clean evaluation
+                    pbar.clear()
+                    print(f"\n--- Evaluation at episode {absolute_episode:,} ---\n")
+                    # Pass training stats to evaluation
+                    training_foul_rate = (total_fouls / (absolute_episode + 1)) * 100 if absolute_episode > 0 else 0
+                    avg_score_per_hand = total_score / (absolute_episode + 1) if absolute_episode > 0 else 0.0
+                    self._evaluate(total_episodes=absolute_episode+1, total_fouls=total_fouls, 
+                                  total_royalties=total_royalties, total_zero=total_zero,
+                                  training_foul_rate=training_foul_rate,
+                                  avg_score_per_hand=avg_score_per_hand)
+                    
+                    # Save checkpoint
+                    checkpoint_path = f'value_net_checkpoint_ep{absolute_episode}.pth'
+                    torch.save(self.model.state_dict(), checkpoint_path)
+                    print(f"\nCheckpoint saved: {checkpoint_path}\n")
         
         pbar.close()
         
@@ -410,6 +532,12 @@ class SelfPlayTrainer:
             print()
         
         self.model.train()
+    
+    def cleanup(self):
+        """Cleanup multiprocessing resources."""
+        if hasattr(self, 'pool'):
+            self.pool.close()
+            self.pool.join()
 
 
 def main():
@@ -417,32 +545,38 @@ def main():
     Main training function.
     Trains the bot through millions of hands to learn good vs bad choices.
     """
-    # Initialize model
+    # Initialize model with larger network for better GPU utilization
     input_dim = get_input_dim()
-    model = ValueNet(input_dim, hidden_dim=256)
+    model = ValueNet(input_dim, hidden_dim=512)  # Increased from 256 to 512
     
     # Initialize trainer (will auto-detect CUDA)
     trainer = SelfPlayTrainer(
         model=model,
-        buffer_size=200000,  # Larger buffer for millions of hands
-        batch_size=64,  # Balanced batch size for speed and GPU utilization
+        #buffer_size=200000,  # Back to original size
+        #batch_size=64,  # Back to original size
+        buffer_size=16000,  # Back to original size
+        batch_size=16,  # Back to original size
         learning_rate=1e-3,
         use_cuda=True  # Will use CUDA if available
     )
     
-    # Train for millions of hands
-    # Start with smaller number for testing, then scale up
-    num_episodes = 1_000_000  # 1 million hands
-    
-    trainer.train(
-        num_episodes=num_episodes,
-        episodes_per_update=10,
-        eval_frequency=10000  # Evaluate every 10k hands
-    )
-    
-    # Save final model
-    torch.save(model.state_dict(), 'value_net.pth')
-    print("Final model saved to value_net.pth")
+    try:
+        # Train for millions of hands
+        # Start with smaller number for testing, then scale up
+        num_episodes = 1_000_000  # 1 million hands
+        
+        trainer.train(
+            num_episodes=num_episodes,
+            episodes_per_update=10,
+            eval_frequency=10000  # Evaluate every 10k hands
+        )
+        
+        # Save final model
+        torch.save(model.state_dict(), 'value_net.pth')
+        print("Final model saved to value_net.pth")
+    finally:
+        # Cleanup multiprocessing resources
+        trainer.cleanup()
 
 
 if __name__ == '__main__':

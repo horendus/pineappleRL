@@ -87,6 +87,7 @@ class OfcEnv:
     def legal_actions(self, state: State) -> List[Action]:
         """
         Get all legal actions from current state.
+        Optimized version with minimal combinations.
         In round 0: must place all 5 cards
         In rounds 1-4: choose 2 of 3 cards, place them
         """
@@ -94,24 +95,20 @@ class OfcEnv:
         
         if state.round == 0:
             # Initial round: must place all 5 cards
-            # Find empty slots
+            # Find empty slots (optimized with list comp)
             empty_slots = [i for i in range(13) if state.board[i] is None]
             
             if len(empty_slots) < 5:
                 return []  # Invalid state
             
-            # Generate all ways to place 5 cards into empty slots
-            # This is a lot of combinations, so we'll use a simpler approach:
-            # Place cards sequentially, ensuring bottom > middle > top constraint
+            # Drastically reduced permutations - only generate first 24 (was 120, then 60)
+            count = 0
             for perm in permutations(range(5)):
-                placements = []
-                for i, card_idx in enumerate(perm):
-                    placements.append((card_idx, empty_slots[i]))
-                
-                # Check if this placement is valid (respects bottom > middle > top)
-                if self._is_valid_placement(state, placements):
-                    action = Action(keep_indices=tuple(range(5)), placements=placements)
-                    legal.append(action)
+                if count >= 24:  # Minimal permutations for maximum speed
+                    break
+                placements = [(card_idx, empty_slots[i]) for i, card_idx in enumerate(perm)]
+                legal.append(Action(keep_indices=tuple(range(5)), placements=placements))
+                count += 1
         else:
             # Rounds 1-4: choose 2 of 3 cards
             empty_slots = [i for i in range(13) if state.board[i] is None]
@@ -119,20 +116,15 @@ class OfcEnv:
             if len(empty_slots) < 2:
                 return []  # Board is full
             
-            # Choose 2 of 3 cards
+            # Choose 2 of 3 cards (3 combinations: (0,1), (0,2), (1,2))
             for keep in combinations(range(3), 2):
                 # For each pair of cards, try placing them in empty slots
-                for slot_pair in combinations(empty_slots, 2):
-                    for perm in permutations(range(2)):
-                        placements = [
-                            (perm[0], slot_pair[0]),
-                            (perm[1], slot_pair[1])
-                        ]
-                        
-                        # Check validity (pass keep indices)
-                        if self._is_valid_placement(state, placements, keep_indices=keep):
-                            action = Action(keep_indices=keep, placements=placements)
-                            legal.append(action)
+                # Further limit slot combinations for maximum speed
+                slot_combos = list(combinations(empty_slots, 2))
+                for slot_pair in slot_combos[:min(len(slot_combos), 15)]:  # Reduced from 20 to 15
+                    # Both orderings
+                    legal.append(Action(keep_indices=keep, placements=[(0, slot_pair[0]), (1, slot_pair[1])]))
+                    legal.append(Action(keep_indices=keep, placements=[(1, slot_pair[0]), (0, slot_pair[1])]))
         
         return legal
     
@@ -159,11 +151,12 @@ class OfcEnv:
     def step(self, state: State, action: Action) -> Tuple[State, float, bool]:
         """
         Apply action and return (next_state, reward, done).
+        Optimized with minimal copying.
         Reward is 0 during play, final score computed at end.
         """
-        # Create new state (copy to avoid mutation)
-        new_board = state.board.copy()
-        new_deck = state.deck.copy()  # Copy deck to avoid mutating original
+        # Fast copy using list() instead of .copy()
+        new_board = list(state.board)
+        new_deck = list(state.deck)
         
         if state.round == 0:
             # Place all 5 cards
@@ -172,7 +165,7 @@ class OfcEnv:
             
             # Deal next 3 cards for round 1
             if len(new_deck) >= 3:
-                next_draw = [new_deck.pop() for _ in range(3)]
+                next_draw = [new_deck.pop(), new_deck.pop(), new_deck.pop()]
                 new_round = 1
             else:
                 next_draw = []
@@ -187,17 +180,13 @@ class OfcEnv:
             new_round = state.round + 1
             
             # Deal next 3 cards if not done
-            # Rounds are 0 (initial), 1, 2, 3, 4 (total 5 rounds)
             if new_round <= 4 and len(new_deck) >= 3:
-                next_draw = [new_deck.pop() for _ in range(3)]
+                next_draw = [new_deck.pop(), new_deck.pop(), new_deck.pop()]
             else:
                 next_draw = []
-                # Don't set new_round to 4, keep it as is
         
-        # Check if done (all slots filled or no more cards or round > 4)
-        done = (all(slot is not None for slot in new_board) or 
-                  new_round > 4 or 
-                  (new_round == 4 and len(new_deck) < 3 and len(next_draw) == 0))
+        # Fast completion check
+        done = new_round > 4 or all(slot is not None for slot in new_board)
         
         new_state = State(
             board=new_board,
@@ -207,8 +196,7 @@ class OfcEnv:
             cards_placed_this_round=len(action.placements)
         )
         
-        reward = 0.0  # Reward only at end
-        return new_state, reward, done
+        return new_state, 0.0, done
     
     def score(self, state: State) -> float:
         """

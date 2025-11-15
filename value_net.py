@@ -9,22 +9,25 @@ import torch.nn as nn
 class ValueNet(nn.Module):
     """Neural network that estimates the value (expected final score) of a state."""
     
-    def __init__(self, input_dim: int, hidden_dim: int = 256):
+    def __init__(self, input_dim: int, hidden_dim: int = 512):
         """
         Args:
             input_dim: Size of encoded state vector
-            hidden_dim: Size of hidden layers
+            hidden_dim: Size of hidden layers (default 512 for better GPU utilization)
         """
         super().__init__()
         
+        # Larger network with more layers for better GPU parallelization
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(0.2),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1)
+            nn.Linear(hidden_dim // 2, 1)
         )
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
