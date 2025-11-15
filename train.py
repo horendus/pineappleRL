@@ -554,7 +554,7 @@ def main():
         model=model,
         #buffer_size=200000,  # Back to original size
         #batch_size=64,  # Back to original size
-        buffer_size=16000,  # Back to original size
+        buffer_size=6000,  # Back to original size
         batch_size=16,  # Back to original size
         learning_rate=1e-3,
         use_cuda=True  # Will use CUDA if available
